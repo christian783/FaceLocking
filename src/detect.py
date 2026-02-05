@@ -15,5 +15,8 @@ while True:
     cv2.imshow('Face Detection', frame)
     if cv2.waitKey(1) == ord('q'):
         break
+
+    if cv2.getWindowProperty('Face Detection', cv2.WND_PROP_VISIBLE) < 1:
+        break
 cap.release()
 cv2.destroyAllWindows()
