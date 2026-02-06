@@ -8,25 +8,24 @@ from datetime import datetime
 import traceback
 
 # ===================== CONFIGURATION =====================
-THRESHOLD = 0.65  # Face recognition similarity threshold
+THRESHOLD = 0.62  # Face recognition similarity threshold
 TARGET_NAME = input("Enter the identity to lock onto (e.g., your name): ").strip().lower()
-MISS_TOLERANCE = 20  # Frames to tolerate no face before unlock
-MOVEMENT_THRESHOLD = 25  # Pixels for left/right movement (reduced for better sensitivity)
-BLINK_EAR_THRESHOLD = 0.21  # Lowered for better blink detection
-SMILE_CONFIDENCE_THRESHOLD = 0.65  # New smile confidence threshold
-CONSECUTIVE_SMILE_FRAMES = 3  # Require smile for N consecutive frames
+MISS_TOLERANCE = 20  # Frames to tolerate no target before unlock
+MOVEMENT_THRESHOLD = 40  # Adjusted for full-frame pixel scale
+BLINK_EAR_THRESHOLD = 0.21
+SMILE_CONFIDENCE_THRESHOLD = 0.65
+CONSECUTIVE_SMILE_FRAMES = 3
+MAX_FACES = 10  # Maximum faces to detect/process per frame
+BBOX_PADDING = 0.25  # Padding around landmarks for bounding box (extra head room)
 
 # ===================== INITIALIZATION =====================
-print("Initializing face detection system...")
+print("Initializing multi-face detection system...")
 
-# Load Haar cascade for face detection
-detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-
-# Initialize MediaPipe Face Mesh
+# Initialize MediaPipe Face Mesh with multi-face support
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=False,
-    max_num_faces=1,
+    max_num_faces=MAX_FACES,
     refine_landmarks=True,
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
@@ -41,223 +40,156 @@ try:
     print(f"Model loaded successfully from {model_path}")
 except Exception as e:
     print(f"Error loading model: {e}")
-    print("Please ensure the model file exists at ../models/embedder_arcface.onnx")
-    print("You can download it from: https://github.com/onnx/models/tree/main/vision/body_analysis/arcface")
     exit(1)
 
-# Reference points for face alignment (standard 5-point alignment)
+# Alignment references
 REF_POINTS = np.array([
-    [38.2946, 51.6963],  # Left eye
-    [73.5318, 51.5014],  # Right eye
-    [56.0252, 71.7366],  # Nose tip
-    [41.5493, 92.3655],  # Left mouth corner
-    [70.7299, 92.2041]  # Right mouth corner
+    [38.2946, 51.6963], [73.5318, 51.5014],
+    [56.0252, 71.7366], [41.5493, 92.3655],
+    [70.7299, 92.2041]
 ], dtype=np.float32)
+INDICES_5PT = [33, 263, 1, 61, 291]
 
-# MediaPipe landmark indices for 5-point alignment
-INDICES_5PT = [33, 263, 1, 61, 291]  # Left eye, right eye, nose, left mouth, right mouth
-
-# Eye landmarks for EAR calculation (left and right eyes)
+# Landmark groups
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [263, 387, 385, 362, 380, 373]
 
-# Mouth landmarks for smile detection
-MOUTH_OUTER = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291]  # Outer lip contour
-MOUTH_INNER = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308]  # Inner lip contour
-MOUTH_TOP = [13, 311, 312, 13, 82]  # Top of upper lip
-MOUTH_BOTTOM = [14, 17, 84, 181, 91]  # Bottom of lower lip
-
-
 # ===================== UTILITY FUNCTIONS =====================
 def preprocess(aligned):
-    """Preprocess aligned face for ArcFace model"""
     img = aligned.astype(np.float32)
-    img = (img - 127.5) / 127.5  # Normalize to [-1, 1]
-    img = np.transpose(img, (2, 0, 1))  # Change to CHW format
-    img = np.expand_dims(img, axis=0)  # Add batch dimension
+    img = (img - 127.5) / 127.5
+    img = np.transpose(img, (2, 0, 1))
+    img = np.expand_dims(img, axis=0)
     return img
 
-
 def get_embedding(aligned):
-    """Extract face embedding using ArcFace"""
     blob = preprocess(aligned)
     emb = session.run(None, {'input.1': blob})[0][0]
-    return emb / np.linalg.norm(emb)  # Normalize to unit vector
-
+    return emb / np.linalg.norm(emb)
 
 def compute_ear(landmarks, eye_indices, h, w):
-    """Compute Eye Aspect Ratio (EAR) for blink detection"""
-    points = np.array([[landmarks.landmark[i].x * w, landmarks.landmark[i].y * h]
-                       for i in eye_indices])
-    # Calculate distances for EAR formula
-    A = np.linalg.norm(points[1] - points[5])  # Vertical distance 1
-    B = np.linalg.norm(points[2] - points[4])  # Vertical distance 2
-    C = np.linalg.norm(points[0] - points[3])  # Horizontal distance
+    points = np.array([[landmarks.landmark[i].x * w, landmarks.landmark[i].y * h] for i in eye_indices])
+    A = np.linalg.norm(points[1] - points[5])
+    B = np.linalg.norm(points[2] - points[4])
+    C = np.linalg.norm(points[0] - points[3])
     return (A + B) / (2.0 * C) if C > 0 else 0
 
-
 def detect_smile(landmarks, h, w, baseline_mouth_width=None, baseline_lip_sep=None):
-    """Advanced smile detection with multiple metrics"""
-    # Get key mouth points
     left_mouth = np.array([landmarks.landmark[61].x * w, landmarks.landmark[61].y * h])
     right_mouth = np.array([landmarks.landmark[291].x * w, landmarks.landmark[291].y * h])
     upper_lip_top = np.array([landmarks.landmark[13].x * w, landmarks.landmark[13].y * h])
     lower_lip_bottom = np.array([landmarks.landmark[14].x * w, landmarks.landmark[14].y * h])
 
-    # Calculate metrics
     mouth_width = np.linalg.norm(left_mouth - right_mouth)
     lip_separation = np.linalg.norm(upper_lip_top - lower_lip_bottom)
 
-    # Get reference points for normalization
     left_eye = np.array([landmarks.landmark[33].x * w, landmarks.landmark[33].y * h])
     right_eye = np.array([landmarks.landmark[263].x * w, landmarks.landmark[263].y * h])
     face_width = np.linalg.norm(left_eye - right_eye)
 
-    # Normalize metrics by face width
     normalized_width = mouth_width / face_width if face_width > 0 else 0
     normalized_sep = lip_separation / face_width if face_width > 0 else 0
 
-    # Check mouth corner upward movement (smile lifts corners)
     nose_tip = np.array([landmarks.landmark[1].x * w, landmarks.landmark[1].y * h])
     left_corner_height = left_mouth[1] - nose_tip[1]
     right_corner_height = right_mouth[1] - nose_tip[1]
 
-    # Calculate smile confidence score (0-1)
     smile_score = 0
-
-    # 1. Mouth width expansion (weight: 0.4)
-    if normalized_width > 0.35:  # Typical smiling mouth is wider
+    if normalized_width > 0.35:
         width_score = min((normalized_width - 0.35) * 10, 1.0)
         smile_score += width_score * 0.4
-
-    # 2. Lip separation (teeth showing) (weight: 0.3)
-    if normalized_sep > 0.08:  # Smiles usually show teeth
+    if normalized_sep > 0.08:
         sep_score = min((normalized_sep - 0.08) * 20, 1.0)
         smile_score += sep_score * 0.3
-
-    # 3. Mouth corner upward movement (weight: 0.3)
     corner_up_score = 0
-    if left_corner_height < -5 and right_corner_height < -5:  # Both corners above nose
+    if left_corner_height < -5 and right_corner_height < -5:
         corner_up_score = 1.0
-    elif left_corner_height < 0 or right_corner_height < 0:  # At least one above nose
+    elif left_corner_height < 0 or right_corner_height < 0:
         corner_up_score = 0.6
     smile_score += corner_up_score * 0.3
 
-    # Use baseline comparison if available
     if baseline_mouth_width and baseline_lip_sep:
         width_increase = mouth_width / baseline_mouth_width if baseline_mouth_width > 0 else 1
         sep_increase = lip_separation / baseline_lip_sep if baseline_lip_sep > 0 else 1
-
-        # Bonus points for relative increase
-        if width_increase > 1.15:  # 15% wider than baseline
+        if width_increase > 1.15:
             smile_score += min(width_increase - 1, 0.2)
-        if sep_increase > 1.3:  # 30% more separation than baseline
+        if sep_increase > 1.3:
             smile_score += min(sep_increase - 1, 0.2)
 
-    # Clamp to [0, 1]
     smile_score = min(max(smile_score, 0), 1)
-
     return smile_score > SMILE_CONFIDENCE_THRESHOLD, smile_score, normalized_width, normalized_sep
 
-
 class ActionDetector:
-    """Class to manage action detection with state tracking"""
-
     def __init__(self):
         self.prev_nose_x = None
-        self.prev_ear = None
         self.baseline_mouth_width = None
         self.baseline_lip_sep = None
         self.smile_frames = 0
         self.blink_frames = 0
-        self.action_cooldown = 0
 
     def update_baseline(self, landmarks, h, w):
-        """Update neutral face baseline metrics"""
         left_mouth = np.array([landmarks.landmark[61].x * w, landmarks.landmark[61].y * h])
         right_mouth = np.array([landmarks.landmark[291].x * w, landmarks.landmark[291].y * h])
         upper_lip_top = np.array([landmarks.landmark[13].x * w, landmarks.landmark[13].y * h])
         lower_lip_bottom = np.array([landmarks.landmark[14].x * w, landmarks.landmark[14].y * h])
-
         self.baseline_mouth_width = np.linalg.norm(left_mouth - right_mouth)
         self.baseline_lip_sep = np.linalg.norm(upper_lip_top - lower_lip_bottom)
 
-    def detect_actions(self, landmarks, h, w, x_offset, y_offset, locked):
-        """Detect all facial actions"""
+    def detect_actions(self, landmarks, h, w, locked):
         actions = []
-
         if not locked:
             return actions
 
-        # Movement detection
-        nose_x = int(landmarks.landmark[1].x * w) + x_offset
+        nose_x = int(landmarks.landmark[1].x * w)
         if self.prev_nose_x is not None:
             delta_x = nose_x - self.prev_nose_x
             if abs(delta_x) > MOVEMENT_THRESHOLD:
                 direction = "right" if delta_x > 0 else "left"
                 actions.append(f"moved {direction} ({abs(delta_x):.0f}px)")
-
         self.prev_nose_x = nose_x
 
-        # Blink detection
         ear_left = compute_ear(landmarks, LEFT_EYE, h, w)
         ear_right = compute_ear(landmarks, RIGHT_EYE, h, w)
         ear = (ear_left + ear_right) / 2
-
         if ear < BLINK_EAR_THRESHOLD:
             self.blink_frames += 1
-            if self.blink_frames == 2:  # Confirm blink on 2nd frame
+            if self.blink_frames == 2:
                 actions.append(f"blink (EAR: {ear:.2f})")
         else:
             self.blink_frames = 0
 
-        # Smile detection
         is_smiling, smile_score, mouth_width_norm, lip_sep_norm = detect_smile(
             landmarks, h, w, self.baseline_mouth_width, self.baseline_lip_sep
         )
-
         if is_smiling:
             self.smile_frames += 1
             if self.smile_frames >= CONSECUTIVE_SMILE_FRAMES:
-                actions.append(f"smile (score: {smile_score:.2f}, width: {mouth_width_norm:.3f})")
+                actions.append(f"smile (score: {smile_score:.2f})")
         else:
             self.smile_frames = 0
-            # Update baseline when not smiling and neutral
-            if 0.25 < mouth_width_norm < 0.33 and 0.05 < lip_sep_norm < 0.08:
-                self.update_baseline(landmarks, h, w)
 
-        # Apply cooldown to avoid duplicate actions
-        if self.action_cooldown > 0:
-            self.action_cooldown -= 1
+        if 0.25 < mouth_width_norm < 0.33 and 0.05 < lip_sep_norm < 0.08:
+            self.update_baseline(landmarks, h, w)
 
         return actions
-
 
 # ===================== LOAD FACE DATABASE =====================
 try:
     db_path = '../data/db/face_db.pkl'
-    if not os.path.exists(db_path):
-        raise FileNotFoundError(f"Database not found at {db_path}")
-
     with open(db_path, 'rb') as f:
         db = pickle.load(f)
-
-    # Process embeddings
     reference = {}
     for name, embs in db.items():
         if len(embs) > 0:
             mean_emb = np.mean(np.array(embs), axis=0)
             mean_emb /= np.linalg.norm(mean_emb)
             reference[name.lower()] = mean_emb
-
     if TARGET_NAME not in reference:
         print(f"Error: {TARGET_NAME} not found in database!")
         print(f"Available identities: {list(reference.keys())}")
         exit(1)
-
     target_emb = reference[TARGET_NAME]
     print(f"Loaded database with {len(reference)} identities")
-
 except Exception as e:
     print(f"Error loading database: {e}")
     traceback.print_exc()
@@ -266,18 +198,21 @@ except Exception as e:
 # ===================== MAIN LOOP =====================
 action_detector = ActionDetector()
 locked = False
+locked_start = None
 miss_count = 0
 prev_bbox = None
 history_file = None
-locked_timestamp = None
 fps_counter = 0
 start_time = datetime.now()
 
 print("\n" + "=" * 50)
-print(f"Target: {TARGET_NAME}")
+print(f"Target: {TARGET_NAME.capitalize()}")
 print("Controls:")
-print("  - Press 'q' to quit")
-print("  - Make sure face is well-lit and visible")
+print(" - Press 'q' to quit")
+print(" - Press 'r' to manually release lock")
+print(" - Colors: Thick Green = locked target | Thin Green = other target instances")
+print("           Yellow = other enrolled people | Red = unknown")
+print(" - Multi-face detection enabled (up to 10 faces per frame)")
 print("=" * 50 + "\n")
 
 cap = cv2.VideoCapture(0)
@@ -285,7 +220,6 @@ if not cap.isOpened():
     print("Error: Could not open camera")
     exit(1)
 
-# Set camera properties for better performance
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 cap.set(cv2.CAP_PROP_FPS, 30)
@@ -293,168 +227,189 @@ cap.set(cv2.CAP_PROP_FPS, 30)
 while True:
     ret, frame = cap.read()
     if not ret:
-        print("Error: Failed to capture frame")
         break
 
-    # Flip horizontally for mirror view and get frame dimensions
     frame = cv2.flip(frame, 1)
     h_frame, w_frame = frame.shape[:2]
     fps_counter += 1
 
-    # Determine region of interest
-    if locked and prev_bbox:
-        x, y, w, h = prev_bbox
-        margin = 120  # Increased margin for better tracking
-        roi_x = max(0, x - margin)
-        roi_y = max(0, y - margin)
-        roi_w = min(w_frame - roi_x, w + 2 * margin)
-        roi_h = min(h_frame - roi_y, h + 2 * margin)
-        roi = frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
-        offset_x, offset_y = roi_x, roi_y
-    else:
-        roi = frame
-        offset_x, offset_y = 0, 0
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(rgb_frame)
 
-    # Convert to grayscale for Haar cascade
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    recognized_faces = []
 
-    # Detect faces
-    faces = detector.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(100, 100),
-        flags=cv2.CASCADE_SCALE_IMAGE
-    )
-
-    face_found = len(faces) > 0
-
-    if face_found:
-        # Take the largest face
-        faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-        x, y, w, h = faces[0]
-
-        # Convert to full frame coordinates
-        x += offset_x
-        y += offset_y
-
-        # Extract face region
-        crop = frame[y:y + h, x:x + w]
-
-        # Ensure crop is valid
-        if crop.size == 0:
-            continue
-
-        # Convert to RGB for MediaPipe
-        rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb_crop)
-
-        if results.multi_face_landmarks:
-            lm = results.multi_face_landmarks[0]
-
-            # Face alignment using 5-point landmarks
-            pts = np.array([[lm.landmark[i].x * w, lm.landmark[i].y * h]
-                            for i in INDICES_5PT], dtype=np.float32)
-
+    if results.multi_face_landmarks:
+        for face_landmarks in results.multi_face_landmarks:
+            # 5-point alignment on full frame
+            pts = np.array([[face_landmarks.landmark[i].x * w_frame,
+                             face_landmarks.landmark[i].y * h_frame] for i in INDICES_5PT],
+                           dtype=np.float32)
             try:
                 M, _ = cv2.estimateAffinePartial2D(pts, REF_POINTS)
-                aligned = cv2.warpAffine(crop, M, (112, 112), flags=cv2.INTER_LINEAR)
+                aligned = cv2.warpAffine(frame, M, (112, 112), flags=cv2.INTER_LINEAR)
 
-                # Face recognition
                 query_emb = get_embedding(aligned)
-                similarity = np.dot(query_emb, target_emb)
 
-                # Action detection
-                actions = action_detector.detect_actions(lm, h, w, x, y, locked)
+                sim_to_target = np.dot(query_emb, target_emb)
+                sims = {n: np.dot(query_emb, emb) for n, emb in reference.items()}
+                best_sim = max(sims.values()) if sims else -1
+                best_name = max(sims, key=sims.get) if best_sim >= THRESHOLD else "Unknown"
 
-                # Locking logic
-                if not locked and similarity >= THRESHOLD:
-                    locked = True
-                    miss_count = 0
-                    locked_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    history_file = f"../data/{TARGET_NAME}_history_{locked_timestamp}.txt"
+                # Compute bounding box with padding
+                x_coords = np.array([l.x for l in face_landmarks.landmark])
+                y_coords = np.array([l.y for l in face_landmarks.landmark])
+                x_min, x_max = np.min(x_coords), np.max(x_coords)
+                y_min, y_max = np.min(y_coords), np.max(y_coords)
 
-                    # Initialize baseline for action detection
-                    action_detector.update_baseline(lm, h, w)
+                width = x_max - x_min
+                height = y_max - y_min
 
-                    with open(history_file, 'w') as f:
-                        f.write(f"Face locking started for {TARGET_NAME} at {datetime.now()}\n")
-                        f.write(f"Initial similarity: {similarity:.4f}\n")
-                        f.write("-" * 50 + "\n")
+                x_min -= width * BBOX_PADDING
+                x_max += width * BBOX_PADDING
+                y_min -= height * (BBOX_PADDING + 0.2)  # Extra room for forehead
+                y_max += height * BBOX_PADDING
 
-                    print(f"\n✓ LOCKED onto {TARGET_NAME} (similarity: {similarity:.3f})")
-                    print(f"  History saved to: {history_file}")
+                x_min_pix = max(0, int(x_min * w_frame))
+                y_min_pix = max(0, int(y_min * h_frame))
+                x_max_pix = min(w_frame, int(x_max * w_frame))
+                y_max_pix = min(h_frame, int(y_max * h_frame))
 
-                # Log actions to history file
-                if locked and actions and history_file:
-                    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    with open(history_file, 'a') as f:
-                        for action in actions:
-                            f.write(f"{timestamp} | {action}\n")
+                w_bbox = x_max_pix - x_min_pix
+                h_bbox = y_max_pix - y_min_pix
 
-                # Draw bounding box and info
-                if locked:
-                    color = (0, 255, 0)  # Green for locked
-                    status_text = f"LOCKED: {TARGET_NAME} ({similarity:.3f})"
+                if w_bbox <= 0 or h_bbox <= 0:
+                    continue
 
-                    # Draw thicker box for locked state
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 3)
-                    cv2.putText(frame, status_text, (x, max(y - 10, 20)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
-                    # Display actions
-                    for i, action in enumerate(actions[:3]):  # Show up to 3 actions
-                        cv2.putText(frame, f"• {action}", (x, y + h + 30 + i * 25),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
-                else:
-                    color = (255, 0, 0)  # Blue for searching
-                    status_text = f"Searching: {TARGET_NAME} ({similarity:.3f})"
-
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                    cv2.putText(frame, status_text, (x, max(y - 10, 20)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-                # Display aligned face
-                cv2.imshow('Aligned Face', aligned)
-
-                # Update tracking variables
-                prev_bbox = (x, y, w, h)
-                miss_count = 0
-
-            except Exception as e:
-                print(f"Error in face processing: {e}")
+                recognized_faces.append({
+                    'bbox': (x_min_pix, y_min_pix, w_bbox, h_bbox),
+                    'name': best_name,
+                    'sim': best_sim,
+                    'sim_to_target': sim_to_target,
+                    'lm': face_landmarks,
+                    'aligned': aligned
+                })
+            except Exception:
                 continue
+
+    # Identify target instances
+    target_faces = [fd for fd in recognized_faces if fd['sim_to_target'] >= THRESHOLD]
+
+    locked_face = None
+    actions = []
+
+    if target_faces:
+        if locked:
+            # Continuity: closest to previous center
+            prev_cx = prev_bbox[0] + prev_bbox[2] // 2
+            prev_cy = prev_bbox[1] + prev_bbox[3] // 2
+            def dist(fd):
+                cx = fd['bbox'][0] + fd['bbox'][2] // 2
+                cy = fd['bbox'][1] + fd['bbox'][3] // 2
+                return (cx - prev_cx)**2 + (cy - prev_cy)**2
+            locked_face = min(target_faces, key=dist)
         else:
-            face_found = False
+            # New lock: highest similarity
+            locked_face = max(target_faces, key=lambda fd: fd['sim_to_target'])
+            locked = True
+            locked_start = datetime.now()
+            miss_count = 0
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            history_file = f"../data/{TARGET_NAME}_history_{timestamp_str}.txt"
+            action_detector.update_baseline(locked_face['lm'], h_frame, w_frame)
+            with open(history_file, 'w') as f:
+                f.write(f"Face locking started for {TARGET_NAME.capitalize()} at {datetime.now()}\n")
+                f.write(f"Initial similarity: {locked_face['sim_to_target']:.4f}\n")
+                f.write("-" * 50 + "\n")
+            print(f"\n✓ LOCKED onto {TARGET_NAME.capitalize()} (similarity: {locked_face['sim_to_target']:.3f})")
+            print(f" History saved to: {history_file}")
+
+        # Detect actions on locked face
+        actions = action_detector.detect_actions(
+            locked_face['lm'], h_frame, w_frame, locked=True
+        )
+        if actions and history_file:
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            with open(history_file, 'a') as f:
+                for action in actions:
+                    f.write(f"{timestamp} | {action}\n")
+
+        prev_bbox = locked_face['bbox']
+        miss_count = 0
     else:
-        # No face detected
         if locked:
             miss_count += 1
             if miss_count > MISS_TOLERANCE:
                 locked = False
-                print("\n⚠ Lock released - face disappeared")
-                if history_file:
+                print("\n⚠ Lock released - target disappeared")
+                if history_file and locked_start:
+                    duration = datetime.now() - locked_start
                     with open(history_file, 'a') as f:
                         f.write(f"\nLock released at {datetime.now()}\n")
-                        f.write(f"Total tracking duration: {datetime.now() - start_time}\n")
+                        f.write(f"Tracking duration: {str(duration).split('.')[0]}\n")
                 history_file = None
-                action_detector = ActionDetector()  # Reset action detector
+                locked_start = None
+                action_detector = ActionDetector()
 
-    # Display FPS and status
+    # Candidate for aligned view when searching
+    candidate_face = None
+    if not locked and recognized_faces:
+        candidate_face = max(recognized_faces, key=lambda fd: fd['sim_to_target'])
+
+    # Show aligned face
+    if locked_face:
+        cv2.imshow('Aligned Face', locked_face['aligned'])
+    elif candidate_face:
+        cv2.imshow('Aligned Face', candidate_face['aligned'])
+    else:
+        cv2.imshow('Aligned Face', np.zeros((112, 112, 3), dtype=np.uint8))
+
+    # Draw all faces
+    for fd in recognized_faces:
+        x, y, w, h = fd['bbox']
+        sim_to_target = fd['sim_to_target']
+
+        if locked_face and fd is locked_face:
+            color = (0, 255, 0)
+            thickness = 4
+            text = f"LOCKED: {TARGET_NAME.capitalize()} ({sim_to_target:.3f})"
+            for i, action in enumerate(actions[:3]):
+                cv2.putText(frame, f"• {action}", (x, y + h + 30 + i * 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+        elif sim_to_target >= THRESHOLD:
+            color = (0, 255, 0)
+            thickness = 2
+            text = f"{TARGET_NAME.capitalize()} ({sim_to_target:.3f})"
+        elif fd['name'] != "Unknown":
+            color = (0, 255, 255)  # Yellow
+            thickness = 2
+            text = f"{fd['name'].capitalize()} ({fd['sim']:.3f})"
+        else:
+            color = (0, 0, 255)  # Red
+            thickness = 2
+            text = f"Unknown ({sim_to_target:.3f})"
+
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
+        cv2.putText(frame, text, (x, max(y - 10, 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+    # Log other enrolled people
+    other_names = {fd['name'] for fd in recognized_faces
+                   if fd['name'] != "Unknown" and fd['sim_to_target'] < THRESHOLD}
+    if locked and other_names:
+        print(f"Other enrolled detected: {', '.join(sorted(other_names))}")
+        if history_file:
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            with open(history_file, 'a') as f:
+                f.write(f"{timestamp} | Others detected: {', '.join(sorted(other_names))}\n")
+
+    # FPS and status
     elapsed = (datetime.now() - start_time).total_seconds()
     fps = fps_counter / elapsed if elapsed > 0 else 0
+    status_line = f"FPS: {fps:.1f} | Status: {'LOCKED' if locked else 'SEARCHING'} | Faces: {len(recognized_faces)}"
+    cv2.putText(frame, status_line, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-    status_line = f"FPS: {fps:.1f} | "
-    status_line += f"Status: {'LOCKED' if locked else 'SEARCHING'} | "
-    status_line += f"Faces: {len(faces)}"
-
-    cv2.putText(frame, status_line, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-    # Display frame
     cv2.imshow('Face Locking System', frame)
 
-    # Handle key presses
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         print("\nExiting...")
@@ -462,23 +417,14 @@ while True:
     elif key == ord('r') and locked:
         print("\nManual lock release")
         locked = False
-        if history_file:
+        if history_file and locked_start:
+            duration = datetime.now() - locked_start
             with open(history_file, 'a') as f:
                 f.write(f"\nManual lock release at {datetime.now()}\n")
+                f.write(f"Tracking duration: {str(duration).split('.')[0]}\n")
+        history_file = None
+        locked_start = None
+        action_detector = ActionDetector()
 
-# ===================== CLEANUP =====================
 cap.release()
 cv2.destroyAllWindows()
-
-# Print summary
-if locked_timestamp:
-    print(f"\nSession summary:")
-    print(f"  Target: {TARGET_NAME}")
-    print(f"  Lock time: {locked_timestamp}")
-    if history_file and os.path.exists(history_file):
-        print(f"  History file: {history_file}")
-        with open(history_file, 'r') as f:
-            lines = f.readlines()
-            action_count = len([l for l in lines if '|' in l])
-            print(f"  Actions logged: {action_count}")
-    print(f"  Total runtime: {datetime.now() - start_time}")
