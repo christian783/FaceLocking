@@ -36,7 +36,10 @@ try:
     model_path = "../models/embedder_arcface.onnx"
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found at {model_path}")
-    session = ort.InferenceSession(model_path)
+    session_options = ort.SessionOptions()
+    session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    session_options.intra_op_num_threads = max(1, (os.cpu_count() or 1) - 1)
+    session = ort.InferenceSession(model_path, sess_options=session_options)
     print(f"Model loaded successfully from {model_path}")
 except Exception as e:
     print(f"Error loading model: {e}")
@@ -188,6 +191,8 @@ try:
         print(f"Error: {TARGET_NAME} not found in database!")
         print(f"Available identities: {list(reference.keys())}")
         exit(1)
+    reference_names = list(reference.keys())
+    reference_matrix = np.stack([reference[name] for name in reference_names], axis=0)
     target_emb = reference[TARGET_NAME]
     print(f"Loaded database with {len(reference)} identities")
 except Exception as e:
@@ -250,10 +255,11 @@ while True:
 
                 query_emb = get_embedding(aligned)
 
-                sim_to_target = np.dot(query_emb, target_emb)
-                sims = {n: np.dot(query_emb, emb) for n, emb in reference.items()}
-                best_sim = max(sims.values()) if sims else -1
-                best_name = max(sims, key=sims.get) if best_sim >= THRESHOLD else "Unknown"
+                sim_to_target = float(np.dot(query_emb, target_emb))
+                sims = reference_matrix @ query_emb
+                best_index = int(np.argmax(sims))
+                best_sim = float(sims[best_index]) if sims.size > 0 else -1
+                best_name = reference_names[best_index] if best_sim >= THRESHOLD else "Unknown"
 
                 # Compute bounding box with padding
                 x_coords = np.array([l.x for l in face_landmarks.landmark])
