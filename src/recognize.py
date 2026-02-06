@@ -3,13 +3,17 @@ import numpy as np
 import mediapipe as mp
 import onnxruntime as ort
 import pickle
+import os
 
 THRESHOLD = 0.62
 
 detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1)
-session = ort.InferenceSession("../models/embedder_arcface.onnx")
+session_options = ort.SessionOptions()
+session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+session_options.intra_op_num_threads = max(1, (os.cpu_count() or 1) - 1)
+session = ort.InferenceSession("../models/embedder_arcface.onnx", sess_options=session_options)
 
 REF_POINTS = np.array([
     [38.2946, 51.6963],
@@ -37,6 +41,8 @@ for name, embs in db.items():
     mean_emb = np.mean(np.array(embs), axis=0)
     mean_emb /= np.linalg.norm(mean_emb)
     reference[name] = mean_emb
+reference_names = list(reference.keys())
+reference_matrix = np.stack([reference[name] for name in reference_names], axis=0) if reference_names else np.empty((0, 0))
 
 cap = cv2.VideoCapture(0)
 while True:
@@ -60,13 +66,14 @@ while True:
             query_emb = session.run(None, {'input.1': blob})[0][0]
             query_emb = query_emb / np.linalg.norm(query_emb)
 
-            max_sim = -1
-            identity = "Unknown"
-            for name, ref_emb in reference.items():
-                sim = np.dot(query_emb, ref_emb)
-                if sim > max_sim:
-                    max_sim = sim
-                    identity = name
+            if reference_matrix.size > 0:
+                sims = reference_matrix @ query_emb
+                best_index = int(np.argmax(sims))
+                max_sim = float(sims[best_index])
+                identity = reference_names[best_index]
+            else:
+                max_sim = -1
+                identity = "Unknown"
 
             label = identity if max_sim >= THRESHOLD else "Unknown"
             color = (0, 255, 0) if label != "Unknown" else (0, 0, 255)
